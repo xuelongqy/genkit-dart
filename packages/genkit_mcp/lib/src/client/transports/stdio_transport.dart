@@ -23,17 +23,26 @@ class StdioClientTransport implements McpClientTransport {
   final Process _process;
   final StreamController<Map<String, dynamic>> _inboundController =
       StreamController.broadcast();
+  final void Function(String message)? _stderrHandler;
   late final StreamSubscription<String> _subscription;
   late final StreamSubscription<List<int>> _stderrSubscription;
 
-  StdioClientTransport._(this._process) {
+  StdioClientTransport._(
+    this._process, {
+    void Function(String message)? stderrHandler,
+  }) : _stderrHandler = stderrHandler {
     _subscription = _process.stdout
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen(_handleLine, onError: _handleError, onDone: _handleDone);
     _stderrSubscription = _process.stderr.listen((data) {
-      final message = utf8.decode(data).trimRight();
+      final message = utf8.decode(data, allowMalformed: true).trimRight();
       if (message.isEmpty) return;
+      final handler = _stderrHandler;
+      if (handler != null) {
+        handler(message);
+        return;
+      }
       stderr.writeln('[MCP Client] $message');
     });
   }
@@ -43,6 +52,7 @@ class StdioClientTransport implements McpClientTransport {
     List<String> args = const [],
     Map<String, String>? environment,
     String? workingDirectory,
+    void Function(String message)? stderrHandler,
   }) async {
     final process = await Process.start(
       command,
@@ -50,7 +60,7 @@ class StdioClientTransport implements McpClientTransport {
       environment: environment,
       workingDirectory: workingDirectory,
     );
-    return StdioClientTransport._(process);
+    return StdioClientTransport._(process, stderrHandler: stderrHandler);
   }
 
   @override

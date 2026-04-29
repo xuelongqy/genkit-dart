@@ -244,7 +244,16 @@ class StreamableHttpServerTransport implements McpServerTransport {
       return;
     }
 
-    final body = await utf8.decoder.bind(request).join();
+    final body = await _readRequestBody(request);
+    if (body == null) {
+      await _writeJsonError(
+        request.response,
+        HttpStatus.badRequest,
+        -32700,
+        'Parse error: Invalid JSON',
+      );
+      return;
+    }
     final parsed = await _parseMessages(body, request.response);
     if (parsed == null) return;
     final messages = parsed.messages;
@@ -507,6 +516,18 @@ class StreamableHttpServerTransport implements McpServerTransport {
   void _applySessionHeader(HttpHeaders headers) {
     if (_sessionId != null) {
       headers.set('mcp-session-id', _sessionId!);
+    }
+  }
+
+  Future<String?> _readRequestBody(HttpRequest request) async {
+    final bytes = await request.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    try {
+      return utf8.decode(bytes);
+    } on FormatException {
+      return null;
     }
   }
 

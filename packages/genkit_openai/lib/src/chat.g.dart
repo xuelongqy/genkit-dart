@@ -39,6 +39,8 @@ base class OpenAIChatOptions {
     double? frequencyPenalty,
     int? seed,
     String? user,
+    String? reasoningEffort,
+    String? reasoningSummary,
     bool? jsonMode,
     String? visualDetailLevel,
   }) {
@@ -52,6 +54,8 @@ base class OpenAIChatOptions {
       'frequencyPenalty': ?frequencyPenalty,
       'seed': ?seed,
       'user': ?user,
+      'reasoningEffort': ?reasoningEffort,
+      'reasoningSummary': ?reasoningSummary,
       'jsonMode': ?jsonMode,
       'visualDetailLevel': ?visualDetailLevel,
     };
@@ -189,6 +193,34 @@ base class OpenAIChatOptions {
     }
   }
 
+  /// Reasoning effort for supported reasoning models.
+  String? get reasoningEffort {
+    return _json['reasoningEffort'] as String?;
+  }
+
+  /// Reasoning effort for supported reasoning models.
+  set reasoningEffort(String? value) {
+    if (value == null) {
+      _json.remove('reasoningEffort');
+    } else {
+      _json['reasoningEffort'] = value;
+    }
+  }
+
+  /// Provider-native reasoning summary preference when supported.
+  String? get reasoningSummary {
+    return _json['reasoningSummary'] as String?;
+  }
+
+  /// Provider-native reasoning summary preference when supported.
+  set reasoningSummary(String? value) {
+    if (value == null) {
+      _json.remove('reasoningSummary');
+    } else {
+      _json['reasoningSummary'] = value;
+    }
+  }
+
   /// JSON mode
   bool? get jsonMode {
     return _json['jsonMode'] as bool?;
@@ -252,6 +284,12 @@ base class _OpenAIChatOptionsTypeFactory
             'frequencyPenalty': $Schema.number(minimum: -2.0, maximum: 2.0),
             'seed': $Schema.integer(),
             'user': $Schema.string(),
+            'reasoningEffort': $Schema.string(
+              enumValues: ['low', 'medium', 'high', 'xhigh'],
+            ),
+            'reasoningSummary': $Schema.string(
+              enumValues: ['auto', 'concise', 'detailed', 'none'],
+            ),
             'jsonMode': $Schema.boolean(),
             'visualDetailLevel': $Schema.string(
               enumValues: ['auto', 'low', 'high'],

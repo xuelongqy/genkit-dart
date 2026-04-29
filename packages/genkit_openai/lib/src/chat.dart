@@ -51,6 +51,14 @@ abstract class $OpenAIChatOptions {
   /// User identifier for abuse detection
   String? get user;
 
+  /// Reasoning effort for supported reasoning models.
+  @StringField(enumValues: ['low', 'medium', 'high', 'xhigh'])
+  String? get reasoningEffort;
+
+  /// Provider-native reasoning summary preference when supported.
+  @StringField(enumValues: ['auto', 'concise', 'detailed', 'none'])
+  String? get reasoningSummary;
+
   /// JSON mode
   bool? get jsonMode;
 

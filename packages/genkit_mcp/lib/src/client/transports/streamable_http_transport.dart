@@ -75,7 +75,10 @@ class StreamableHttpClientTransport implements McpClientTransport {
     }
 
     if (response.statusCode != HttpStatus.ok) {
-      final text = await response.transform(utf8.decoder).join();
+      final text = await _readResponseText(
+        response,
+        context: 'HTTP error response',
+      );
       throw StateError(
         '[MCP Client] HTTP ${response.statusCode}: ${text.trim()}',
       );
@@ -87,7 +90,7 @@ class StreamableHttpClientTransport implements McpClientTransport {
       return;
     }
     if (contentType.contains('application/json')) {
-      final body = await response.transform(utf8.decoder).join();
+      final body = await _readResponseText(response, context: 'JSON response');
       _handleJsonBody(body);
       return;
     }
@@ -137,7 +140,10 @@ class StreamableHttpClientTransport implements McpClientTransport {
       return;
     }
     if (response.statusCode != HttpStatus.ok) {
-      final text = await response.transform(utf8.decoder).join();
+      final text = await _readResponseText(
+        response,
+        context: 'standalone SSE response',
+      );
       mcpLogger.warning(
         '[MCP Client] Standalone SSE failed: ${response.statusCode} ${text.trim()}',
       );
@@ -153,7 +159,7 @@ class StreamableHttpClientTransport implements McpClientTransport {
   }) {
     var buffer = '';
     return response
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .listen(
           (chunk) {
             buffer += chunk;
@@ -284,6 +290,25 @@ class StreamableHttpClientTransport implements McpClientTransport {
 
   bool _isInitializedNotification(Map<String, dynamic> message) {
     return message['method'] == 'notifications/initialized';
+  }
+
+  Future<String> _readResponseText(
+    HttpClientResponse response, {
+    required String context,
+  }) async {
+    final bytes = await response.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    try {
+      return utf8.decode(bytes);
+    } on FormatException {
+      final fallback = utf8.decode(bytes, allowMalformed: true);
+      mcpLogger.warning(
+        '[MCP Client] $context contained malformed UTF-8; decoded with replacement characters.',
+      );
+      return fallback;
+    }
   }
 }
 

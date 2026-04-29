@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -79,6 +80,21 @@ Future<HttpClientResponse> _postRaw(
   request.headers.set(HttpHeaders.acceptHeader, accept);
   headers?.forEach(request.headers.set);
   request.write(body);
+  return request.close();
+}
+
+Future<HttpClientResponse> _postBytes(
+  HttpClient client,
+  Uri url,
+  List<int> body, {
+  String accept = 'application/json, text/event-stream',
+  Map<String, String>? headers,
+}) async {
+  final request = await client.postUrl(url);
+  request.headers.contentType = ContentType.json;
+  request.headers.set(HttpHeaders.acceptHeader, accept);
+  headers?.forEach(request.headers.set);
+  request.add(body);
   return request.close();
 }
 
@@ -386,6 +402,64 @@ void main() {
       await testServer.server.close();
     }
   });
+
+  test(
+    'POST rejects invalid UTF-8 payload without throwing transport errors',
+    () async {
+      final testServer = await _startServer(enableJsonResponse: true);
+      final client = HttpClient();
+      try {
+        final response = await _postBytes(client, testServer.url, <int>[
+          0x7b,
+          0x22,
+          0x78,
+          0x22,
+          0x3a,
+          0x80,
+          0x7d,
+        ]);
+
+        expect(response.statusCode, HttpStatus.badRequest);
+        final body = await response.transform(utf8.decoder).join();
+        final decoded = jsonDecode(body) as Map<String, dynamic>;
+        final error = decoded['error'] as Map<String, dynamic>;
+        expect(error['code'], -32700);
+        expect(error['message'], contains('Parse error'));
+      } finally {
+        client.close(force: true);
+        await testServer.server.close();
+      }
+    },
+  );
+
+  test(
+    'client transport converts malformed UTF-8 responses into StateError',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final url = Uri.parse(
+        'http://${server.address.address}:${server.port}/mcp',
+      );
+      unawaited(() async {
+        await for (final request in server) {
+          request.response.statusCode = HttpStatus.internalServerError;
+          request.response.headers.contentType = ContentType.json;
+          request.response.add(<int>[0x80, 0x61, 0x62]);
+          await request.response.close();
+        }
+      }());
+
+      final transport = await StreamableHttpClientTransport.connect(url: url);
+      try {
+        await expectLater(
+          () => transport.send(_initializeRequest(1)),
+          throwsA(isA<StateError>()),
+        );
+      } finally {
+        await transport.close();
+        await server.close(force: true);
+      }
+    },
+  );
 
   test('POST rejects non-object JSON payload', () async {
     final testServer = await _startServer(enableJsonResponse: true);

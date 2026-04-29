@@ -67,6 +67,20 @@ class CustomModelDefinition {
 /// Signature used to provide an API key (or bearer token) for requests.
 typedef OpenAIApiKeyProvider = FutureOr<String> Function();
 
+/// Preferred HTTP wire API for OpenAI-compatible providers.
+enum OpenAIWireApi {
+  /// Use the OpenAI Responses API.
+  responses('responses'),
+
+  /// Use the legacy Chat Completions API.
+  chatCompletions('chat_completions');
+
+  const OpenAIWireApi(this.storageValue);
+
+  /// Stable string representation for storing configuration.
+  final String storageValue;
+}
+
 /// Public constant handle for the OpenAI-compatible plugin.
 ///
 /// Use this to create the plugin and to reference models:
@@ -107,6 +121,7 @@ class OpenAICompatPluginHandle {
     List<CustomModelDefinition>? models,
     Map<String, String>? headers,
     http.Client? httpClient,
+    OpenAIWireApi wireApi = OpenAIWireApi.responses,
   }) {
     return OpenAIPlugin(
       name: name,
@@ -116,6 +131,7 @@ class OpenAICompatPluginHandle {
       customModels: models ?? const [],
       headers: headers,
       httpClient: httpClient,
+      wireApi: wireApi,
     );
   }
 

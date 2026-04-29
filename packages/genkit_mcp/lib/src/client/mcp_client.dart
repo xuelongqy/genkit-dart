@@ -36,6 +36,9 @@ typedef McpElicitationHandler =
 typedef McpNotificationHandler =
     void Function(String method, Map<String, dynamic> params);
 
+/// Handler for raw stderr lines emitted by stdio MCP servers.
+typedef McpStdioStderrHandler = void Function(String message);
+
 /// An MCP root entry advertised to the server via `roots/list`.
 class McpRoot {
   final String uri;
@@ -62,6 +65,7 @@ class McpServerConfig {
   final Duration? timeout;
   final bool disabled;
   final List<McpRoot>? roots;
+  final McpStdioStderrHandler? stderrHandler;
 
   const McpServerConfig({
     this.transport,
@@ -73,6 +77,7 @@ class McpServerConfig {
     this.timeout,
     this.disabled = false,
     this.roots,
+    this.stderrHandler,
   });
 }
 
@@ -422,6 +427,7 @@ class GenkitMcpClient {
       command: command,
       args: config.args,
       environment: config.environment,
+      stderrHandler: config.stderrHandler,
     );
   }
 

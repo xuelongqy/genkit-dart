@@ -61,6 +61,18 @@ abstract final class GenkitConverter {
     return result;
   }
 
+  /// Convert Genkit messages to Responses API input items.
+  static sdk.ResponseInput toOpenAIResponseInput(
+    List<Message> messages,
+    String? visualDetailLevel,
+  ) {
+    final itemMaps = <Map<String, dynamic>>[];
+    for (final message in messages) {
+      itemMaps.addAll(_toOpenAIResponseItemMaps(message, visualDetailLevel));
+    }
+    return sdk.ResponseInput.fromOutputItems(itemMaps);
+  }
+
   /// Convert a single Genkit message to OpenAI format
   /// Note: Tool messages are handled separately in toOpenAIMessages()
   static sdk.ChatMessage toOpenAIMessage(
@@ -101,15 +113,26 @@ abstract final class GenkitConverter {
     }
     if (part.isMedia) {
       final media = part.media!;
+      final mimeType = media.contentType?.toLowerCase();
       if (media.url.startsWith('data:')) {
         // Parse data URI: data:<mediaType>;base64,<data>
         final commaIdx = media.url.indexOf(',');
         final base64Data = media.url.substring(commaIdx + 1);
-        final mimeType = media.contentType ?? 'image/png';
+        if (_isAudioMimeType(mimeType)) {
+          return sdk.ContentPart.inputAudio(
+            data: base64Data,
+            format: _mapAudioFormat(mimeType!),
+          );
+        }
         return sdk.ContentPart.imageBase64(
           data: base64Data,
-          mediaType: mimeType,
+          mediaType: mimeType ?? 'image/png',
           detail: _mapVisualDetailLevel(visualDetailLevel),
+        );
+      }
+      if (_isAudioMimeType(mimeType)) {
+        throw UnimplementedError(
+          'Audio MediaPart currently requires a data: URI payload.',
         );
       }
       return sdk.ContentPart.imageUrl(
@@ -126,6 +149,25 @@ abstract final class GenkitConverter {
       'low' => sdk.ImageDetail.low,
       'high' => sdk.ImageDetail.high,
       _ => sdk.ImageDetail.auto,
+    };
+  }
+
+  static bool _isAudioMimeType(String? mimeType) {
+    return mimeType != null && mimeType.startsWith('audio/');
+  }
+
+  static sdk.AudioFormat _mapAudioFormat(String mimeType) {
+    return switch (mimeType) {
+      'audio/wav' || 'audio/x-wav' => sdk.AudioFormat.wav,
+      'audio/mpeg' || 'audio/mp3' => sdk.AudioFormat.mp3,
+      'audio/flac' => sdk.AudioFormat.flac,
+      'audio/ogg' ||
+      'audio/opus' ||
+      'audio/ogg; codecs=opus' => sdk.AudioFormat.opus,
+      'audio/pcm' || 'audio/pcm16' => sdk.AudioFormat.pcm16,
+      _ => throw UnimplementedError(
+        'Unsupported audio MediaPart contentType: $mimeType',
+      ),
     };
   }
 
@@ -175,6 +217,23 @@ abstract final class GenkitConverter {
     );
   }
 
+  /// Convert Genkit tool to Responses API format.
+  static sdk.ResponseTool toOpenAIResponseTool(ToolDefinition tool) {
+    var parameters = tool.inputSchema;
+
+    if (parameters == null) {
+      parameters = {'type': 'object', 'properties': {}};
+    } else if (!parameters.containsKey('type')) {
+      parameters = {'type': 'object', ...parameters};
+    }
+
+    return sdk.ResponseTool.function(
+      name: tool.name,
+      description: tool.description,
+      parameters: parameters,
+    );
+  }
+
   /// Convert OpenAI assistant message to Genkit format.
   ///
   /// This is used for converting response messages from the OpenAI API.
@@ -182,6 +241,34 @@ abstract final class GenkitConverter {
   /// optional text content, refusal, and/or tool calls.
   static Message fromOpenAIAssistantMessage(sdk.AssistantMessage msg) {
     final parts = <Part>[];
+
+    final summaryDetails =
+        (msg.reasoningDetails ?? const <sdk.ReasoningDetail>[])
+            .where(
+              (detail) =>
+                  detail.isSummary && (detail.text?.isNotEmpty ?? false),
+            )
+            .toList(growable: false);
+    if (summaryDetails.isNotEmpty) {
+      for (final detail in summaryDetails.indexed) {
+        parts.add(
+          ReasoningPart(
+            reasoning: detail.$2.text!,
+            metadata: <String, dynamic>{
+              'reasoningType': 'summary',
+              if (detail.$1 > 0) 'sectionBreak': true,
+            },
+          ),
+        );
+      }
+    } else if (msg.reasoning?.isNotEmpty ?? false) {
+      parts.add(
+        ReasoningPart(
+          reasoning: msg.reasoning!,
+          metadata: const <String, dynamic>{'reasoningType': 'summary'},
+        ),
+      );
+    }
 
     // Handle refusal
     if (msg.refusal != null && msg.refusal!.isNotEmpty) {
@@ -214,6 +301,64 @@ abstract final class GenkitConverter {
     return Message(role: Role.model, content: parts);
   }
 
+  /// Convert a Responses API response to Genkit format.
+  static Message fromOpenAIResponse(sdk.Response response) {
+    final parts = <Part>[];
+    var emittedReasoningSummary = false;
+
+    for (final item in response.output) {
+      if (item is sdk.ReasoningItem) {
+        for (final summary in item.summary) {
+          parts.add(
+            ReasoningPart(
+              reasoning: summary.text,
+              metadata: <String, dynamic>{
+                'reasoningType': 'summary',
+                if (emittedReasoningSummary) 'sectionBreak': true,
+              },
+            ),
+          );
+          emittedReasoningSummary = true;
+        }
+        continue;
+      }
+
+      if (item is sdk.MessageOutputItem) {
+        final metadata = _assistantTextMetadata(
+          itemId: item.id,
+          phase: item.phase,
+        );
+        for (final content in item.content) {
+          switch (content) {
+            case sdk.OutputTextContent(:final text):
+              parts.add(TextPart(text: text, metadata: metadata));
+            case sdk.RefusalContent(:final refusal):
+              parts.add(
+                TextPart(text: '[Refusal] $refusal', metadata: metadata),
+              );
+            default:
+              break;
+          }
+        }
+        continue;
+      }
+
+      if (item is sdk.FunctionCallOutputItemResponse) {
+        parts.add(
+          ToolRequestPart(
+            toolRequest: ToolRequest(
+              ref: item.callId,
+              name: item.name,
+              input: item.argumentsMap,
+            ),
+          ),
+        );
+      }
+    }
+
+    return Message(role: Role.model, content: parts);
+  }
+
   /// Map OpenAI finish reason to Genkit FinishReason
   static FinishReason mapFinishReason(String? reason) {
     return switch (reason) {
@@ -222,6 +367,206 @@ abstract final class GenkitConverter {
       'content_filter' => FinishReason.blocked,
       'tool_calls' => FinishReason.stop,
       _ => FinishReason.unknown,
+    };
+  }
+
+  /// Map Responses API terminal state to Genkit FinishReason.
+  static FinishReason mapResponseFinishReason(sdk.Response response) {
+    return switch (response.status) {
+      sdk.ResponseStatus.completed => FinishReason.stop,
+      sdk.ResponseStatus.incomplete =>
+        switch (response.incompleteDetails?.reason) {
+          'max_output_tokens' || 'max_tokens' => FinishReason.length,
+          _ => FinishReason.unknown,
+        },
+      sdk.ResponseStatus.failed =>
+        _isContentFilteredResponse(response)
+            ? FinishReason.blocked
+            : FinishReason.unknown,
+      _ => FinishReason.unknown,
+    };
+  }
+
+  static List<Map<String, dynamic>> _toOpenAIResponseItemMaps(
+    Message message,
+    String? visualDetailLevel,
+  ) {
+    if (message.role == Role.system || message.role == Role.user) {
+      return <Map<String, dynamic>>[
+        <String, dynamic>{
+          'type': 'message',
+          'role': message.role == Role.system ? 'system' : 'user',
+          'content': message.content
+              .map(
+                (part) => _toOpenAIResponseContentPartMap(
+                  part,
+                  visualDetailLevel,
+                  assistant: false,
+                ),
+              )
+              .toList(growable: false),
+        },
+      ];
+    }
+
+    if (message.role == Role.model) {
+      final items = <Map<String, dynamic>>[];
+      final assistantContent = message.content
+          .where((part) => part.isText)
+          .map(
+            (part) => _toOpenAIResponseContentPartMap(
+              part,
+              visualDetailLevel,
+              assistant: true,
+            ),
+          )
+          .toList(growable: false);
+      if (assistantContent.isNotEmpty) {
+        items.add(<String, dynamic>{
+          'type': 'message',
+          'role': 'assistant',
+          'content': assistantContent,
+        });
+      }
+      for (final part in message.content) {
+        if (!part.isToolRequest) {
+          continue;
+        }
+        final toolRequest = part.toolRequest!;
+        final ref = toolRequest.ref;
+        if (ref == null || ref.isEmpty) {
+          throw ArgumentError(
+            'ToolRequest.ref must be a non-empty string when converting to OpenAI responses items',
+          );
+        }
+        items.add(<String, dynamic>{
+          'type': 'function_call',
+          'call_id': ref,
+          'name': toolRequest.name,
+          'arguments': jsonEncode(
+            toolRequest.input ?? const <String, dynamic>{},
+          ),
+        });
+      }
+      return items;
+    }
+
+    final toolResponses = message.content
+        .where((p) => p.isToolResponse)
+        .map((p) => p.toolResponse!)
+        .toList(growable: false);
+    if (toolResponses.isEmpty) {
+      throw ArgumentError(
+        'Tool message must contain at least one ToolResponsePart',
+      );
+    }
+    return toolResponses
+        .map((toolResponse) {
+          final ref = toolResponse.ref;
+          if (ref == null || ref.isEmpty) {
+            throw ArgumentError(
+              'ToolResponse.ref must be a non-empty string for tool messages',
+            );
+          }
+          return <String, dynamic>{
+            'type': 'function_call_output',
+            'call_id': ref,
+            'output': jsonEncode(toolResponse.output),
+          };
+        })
+        .toList(growable: false);
+  }
+
+  static Map<String, dynamic> _toOpenAIResponseContentPartMap(
+    Part part,
+    String? visualDetailLevel, {
+    required bool assistant,
+  }) {
+    if (part.isText) {
+      return <String, dynamic>{
+        'type': assistant ? 'output_text' : 'input_text',
+        'text': part.text!,
+      };
+    }
+    if (!part.isMedia) {
+      throw UnimplementedError('Unsupported part type: $part');
+    }
+
+    final media = part.media!;
+    final mimeType = media.contentType?.toLowerCase();
+    final detail = _mapVisualDetailLevel(visualDetailLevel);
+    if (media.url.startsWith('data:')) {
+      final commaIdx = media.url.indexOf(',');
+      final base64Data = media.url.substring(commaIdx + 1);
+      if (_isAudioMimeType(mimeType)) {
+        return <String, dynamic>{
+          'type': 'input_audio',
+          'input_audio': <String, dynamic>{
+            'data': base64Data,
+            'format': _mapAudioFormat(mimeType!).toJson(),
+          },
+        };
+      }
+      if (_isVideoMimeType(mimeType)) {
+        throw UnimplementedError(
+          'Video MediaPart currently requires a non-data URL payload for Responses API.',
+        );
+      }
+      if (_isImageMimeType(mimeType) || mimeType == null) {
+        return <String, dynamic>{
+          'type': 'input_image',
+          'image_url': media.url,
+          'detail': detail.toJson(),
+        };
+      }
+      return <String, dynamic>{'type': 'input_file', 'file_data': media.url};
+    }
+    if (_isAudioMimeType(mimeType)) {
+      throw UnimplementedError(
+        'Audio MediaPart currently requires a data: URI payload.',
+      );
+    }
+    if (_isVideoMimeType(mimeType)) {
+      return <String, dynamic>{'type': 'input_video', 'video_url': media.url};
+    }
+    if (_isImageMimeType(mimeType) || mimeType == null) {
+      return <String, dynamic>{
+        'type': 'input_image',
+        'image_url': media.url,
+        'detail': detail.toJson(),
+      };
+    }
+    return <String, dynamic>{'type': 'input_file', 'file_url': media.url};
+  }
+
+  static bool _isImageMimeType(String? mimeType) {
+    return mimeType != null && mimeType.startsWith('image/');
+  }
+
+  static bool _isVideoMimeType(String? mimeType) {
+    return mimeType != null && mimeType.startsWith('video/');
+  }
+
+  static bool _isContentFilteredResponse(sdk.Response response) {
+    final type = response.error?.type.toLowerCase();
+    final code = response.error?.code?.toLowerCase();
+    final message = response.error?.message.toLowerCase() ?? '';
+    return type == 'content_filter' ||
+        code == 'content_filter' ||
+        message.contains('content filter');
+  }
+
+  static Map<String, dynamic>? _assistantTextMetadata({
+    required String itemId,
+    required sdk.MessagePhase? phase,
+  }) {
+    final normalizedItemId = itemId.trim();
+    if (normalizedItemId.isEmpty && phase == null) {
+      return null;
+    }
+    return <String, dynamic>{
+      if (normalizedItemId.isNotEmpty) 'assistantMessageId': normalizedItemId,
+      if (phase != null) 'assistantMessagePhase': phase.toJson(),
     };
   }
 }
