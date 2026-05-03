@@ -219,6 +219,14 @@ abstract final class GenkitConverter {
 
   /// Convert Genkit tool to Responses API format.
   static sdk.ResponseTool toOpenAIResponseTool(ToolDefinition tool) {
+    final metadata = tool.metadata ?? const <String, dynamic>{};
+    final nativeToolType = metadata['nativeToolType'] as String?;
+    if (nativeToolType == 'image_generation') {
+      return sdk.ResponseTool.imageGeneration(
+        outputFormat: metadata['outputFormat'] as String? ?? 'png',
+      );
+    }
+
     var parameters = tool.inputSchema;
 
     if (parameters == null) {
@@ -351,6 +359,22 @@ abstract final class GenkitConverter {
               name: item.name,
               input: item.argumentsMap,
             ),
+          ),
+        );
+      }
+
+      if (item is sdk.ImageGenerationCallOutputItem) {
+        parts.add(
+          CustomPart(
+            custom: <String, dynamic>{
+              'type': 'image_generation_call',
+              'id': item.id,
+              if (item.prompt != null) 'prompt': item.prompt,
+              if (item.revisedPrompt != null)
+                'revisedPrompt': item.revisedPrompt,
+              if (item.result != null) 'result': item.result,
+              if (item.status != null) 'status': item.status!.toJson(),
+            },
           ),
         );
       }

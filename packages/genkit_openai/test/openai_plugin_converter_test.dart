@@ -441,6 +441,26 @@ void main() {
     });
   });
 
+  group('GenkitConverter.toOpenAIResponseTool', () {
+    test('converts native image generation metadata to hosted tool', () {
+      final tool = ToolDefinition(
+        name: 'image_generation',
+        description: 'Generate images',
+        inputSchema: const <String, Object?>{},
+        metadata: const <String, Object?>{
+          'nativeToolType': 'image_generation',
+          'outputFormat': 'png',
+        },
+      );
+
+      final result = GenkitConverter.toOpenAIResponseTool(tool);
+      expect(result.toJson(), <String, Object?>{
+        'type': 'image_generation',
+        'output_format': 'png',
+      });
+    });
+  });
+
   group('GenkitConverter.toOpenAIResponseInput', () {
     test('converts mixed message history into responses input items', () {
       final input = GenkitConverter.toOpenAIResponseInput(<Message>[
@@ -602,6 +622,33 @@ void main() {
       expect(part.isText, isTrue);
       expect(part.metadata?['assistantMessageId'], 'msg_1');
       expect(part.metadata?['assistantMessagePhase'], 'commentary');
+    });
+
+    test('maps image generation output items to custom parts', () {
+      final response = sdk.Response(
+        id: 'resp_1',
+        object: 'response',
+        createdAt: 0,
+        status: sdk.ResponseStatus.completed,
+        output: const <sdk.OutputItem>[
+          sdk.ImageGenerationCallOutputItem(
+            id: 'ig_1',
+            prompt: 'Draw a fox.',
+            revisedPrompt: 'Draw a red fox.',
+            result: 'aW1hZ2U=',
+            status: sdk.ItemStatus.completed,
+          ),
+        ],
+      );
+
+      final message = GenkitConverter.fromOpenAIResponse(response);
+      final custom = message.content.single.custom;
+      expect(custom?['type'], 'image_generation_call');
+      expect(custom?['id'], 'ig_1');
+      expect(custom?['prompt'], 'Draw a fox.');
+      expect(custom?['revisedPrompt'], 'Draw a red fox.');
+      expect(custom?['result'], 'aW1hZ2U=');
+      expect(custom?['status'], 'completed');
     });
   });
 
