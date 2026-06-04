@@ -490,7 +490,7 @@ class OpenAIPlugin extends GenkitPlugin {
     final streamState = _ResponsesStreamState();
 
     try {
-      await for (final event in client.responses.createStream(request)) {
+      await for (final event in _createResponsesStream(client, request)) {
         streamState.add(event);
         switch (event) {
           case sdk.OutputTextDeltaEvent():
@@ -583,6 +583,17 @@ class OpenAIPlugin extends GenkitPlugin {
     return _modelResponseFromOpenAIResponse(
       _rebuildResponseFromResponsesStream(response, streamState),
     );
+  }
+
+  Stream<sdk.ResponseStreamEvent> _createResponsesStream(
+    sdk.OpenAIClient client,
+    sdk.CreateResponseRequest request,
+  ) {
+    final requestBody = request.toJson();
+    requestBody['stream'] = true;
+    return client.responses
+        .streamSseEvents(endpoint: '/responses', body: requestBody)
+        .map(_responseStreamEventFromJson);
   }
 
   /// Handle non-streaming response
@@ -810,6 +821,38 @@ sdk.Response rebuildResponseFromResponsesStreamForTest(
     state.add(event);
   }
   return _rebuildResponseFromResponsesStream(response, state);
+}
+
+@visibleForTesting
+sdk.ResponseStreamEvent responseStreamEventFromJsonForTest(
+  Map<String, dynamic> json,
+) => _responseStreamEventFromJson(json);
+
+sdk.ResponseStreamEvent _responseStreamEventFromJson(
+  Map<String, dynamic> json,
+) {
+  return sdk.ResponseStreamEvent.fromJson(
+    _normalizeResponseStreamEventJson(json),
+  );
+}
+
+Map<String, dynamic> _normalizeResponseStreamEventJson(
+  Map<String, dynamic> json,
+) {
+  final type = json['type'];
+  if (type != 'response.completed' &&
+      type != 'response.incomplete' &&
+      type != 'response.failed') {
+    return json;
+  }
+  final response = json['response'];
+  if (response is! Map<String, dynamic> || response['output'] != null) {
+    return json;
+  }
+  return <String, dynamic>{
+    ...json,
+    'response': <String, dynamic>{...response, 'output': const <Object?>[]},
+  };
 }
 
 @visibleForTesting

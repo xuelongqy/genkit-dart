@@ -21,6 +21,7 @@ import 'package:genkit_openai/src/openai_plugin.dart'
         mapOpenRouterReasoningForTest,
         mapReasoningEffortForTest,
         rebuildResponseFromResponsesStreamForTest,
+        responseStreamEventFromJsonForTest,
         shouldFallbackStreamingToNonStreamingForTest,
         shouldRetryWithoutReasoningSummaryForTest,
         validateReasoningEffortForTest;
@@ -649,6 +650,118 @@ void main() {
       expect(custom?['revisedPrompt'], 'Draw a red fox.');
       expect(custom?['result'], 'aW1hZ2U=');
       expect(custom?['status'], 'completed');
+    });
+  });
+
+  group('responseStreamEventFromJsonForTest', () {
+    Map<String, dynamic> responseJson(String status, Object? output) {
+      return <String, dynamic>{
+        'id': 'resp_1',
+        'object': 'response',
+        'created_at': 0,
+        'status': status,
+        'output': output,
+      };
+    }
+
+    test('normalizes completed final response with null output', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.completed',
+        'response': responseJson('completed', null),
+      });
+
+      expect(event, isA<sdk.ResponseCompletedEvent>());
+      expect((event as sdk.ResponseCompletedEvent).response.output, isEmpty);
+    });
+
+    test('normalizes incomplete final response with null output', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.incomplete',
+        'response': responseJson('incomplete', null),
+      });
+
+      expect(event, isA<sdk.ResponseIncompleteEvent>());
+      expect((event as sdk.ResponseIncompleteEvent).response.output, isEmpty);
+    });
+
+    test('normalizes failed final response with null output', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.failed',
+        'response': <String, dynamic>{
+          ...responseJson('failed', null),
+          'error': <String, dynamic>{
+            'code': 'provider_error',
+            'message': 'The provider failed.',
+          },
+        },
+      });
+
+      expect(event, isA<sdk.ResponseFailedEvent>());
+      expect((event as sdk.ResponseFailedEvent).response.output, isEmpty);
+      expect(event.response.error?.message, 'The provider failed.');
+    });
+
+    test('preserves non-empty completed output', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.completed',
+        'response': responseJson('completed', <Map<String, dynamic>>[
+          <String, dynamic>{
+            'type': 'message',
+            'id': 'msg_1',
+            'role': 'assistant',
+            'content': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'output_text', 'text': 'Hello'},
+            ],
+            'status': 'completed',
+          },
+        ]),
+      });
+
+      expect(event, isA<sdk.ResponseCompletedEvent>());
+      final output = (event as sdk.ResponseCompletedEvent).response.output;
+      expect(output, hasLength(1));
+      expect(output.single, isA<sdk.MessageOutputItem>());
+    });
+
+    test('preserves tool and reasoning recovery events', () {
+      final events = <sdk.ResponseStreamEvent>[
+        responseStreamEventFromJsonForTest(<String, dynamic>{
+          'type': 'response.output_item.done',
+          'output_index': 0,
+          'item': <String, dynamic>{
+            'type': 'reasoning',
+            'id': 'reasoning_1',
+            'summary': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'summary_text', 'text': 'Checked.'},
+            ],
+          },
+        }),
+        responseStreamEventFromJsonForTest(<String, dynamic>{
+          'type': 'response.output_item.done',
+          'output_index': 1,
+          'item': <String, dynamic>{
+            'type': 'function_call',
+            'id': 'call_1',
+            'call_id': 'tool_1',
+            'name': 'read_file',
+            'arguments': '{"path":"README.md"}',
+          },
+        }),
+      ];
+
+      final rebuilt = rebuildResponseFromResponsesStreamForTest(
+        sdk.Response(
+          id: 'resp_1',
+          object: 'response',
+          createdAt: 0,
+          status: sdk.ResponseStatus.completed,
+          output: const <sdk.OutputItem>[],
+        ),
+        events,
+      );
+
+      expect(rebuilt.output.first, isA<sdk.ReasoningItem>());
+      expect(rebuilt.output.last, isA<sdk.FunctionCallOutputItemResponse>());
     });
   });
 
