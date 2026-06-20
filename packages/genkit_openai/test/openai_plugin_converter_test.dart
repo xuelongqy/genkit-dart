@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import 'dart:convert';
+
 import 'package:genkit/genkit.dart' hide Tool;
 import 'package:genkit_openai/genkit_openai.dart';
 import 'package:genkit_openai/src/openai_plugin.dart'
@@ -20,8 +22,12 @@ import 'package:genkit_openai/src/openai_plugin.dart'
         assistantTextPartsFromResponsesEventsForTest,
         mapOpenRouterReasoningForTest,
         mapReasoningEffortForTest,
+        modelResponseFromOpenAIResponseForTest,
+        modelResponseFromResponsesEventsForTest,
+        normalizeOpenAIResponseJsonForTest,
         rebuildResponseFromResponsesStreamForTest,
         responseStreamEventFromJsonForTest,
+        shouldFallbackResponsesToChatCompletionsForTest,
         shouldFallbackStreamingToNonStreamingForTest,
         shouldRetryWithoutReasoningSummaryForTest,
         validateReasoningEffortForTest;
@@ -195,6 +201,17 @@ void main() {
       expect(shouldFallback, isTrue);
     });
 
+    test('falls back for responses stream end without final response', () {
+      final shouldFallback = shouldFallbackStreamingToNonStreamingForTest(
+        error: GenkitException(
+          'Responses stream ended without a final response.',
+        ),
+        receivedAnyChunk: false,
+      );
+
+      expect(shouldFallback, isTrue);
+    });
+
     test('does not fall back after any streaming chunk was received', () {
       final shouldFallback = shouldFallbackStreamingToNonStreamingForTest(
         error: http.ClientException('Connection closed while receiving data'),
@@ -207,6 +224,111 @@ void main() {
     test('does not fall back for unrelated errors', () {
       final shouldFallback = shouldFallbackStreamingToNonStreamingForTest(
         error: ArgumentError('invalid request'),
+        receivedAnyChunk: false,
+      );
+
+      expect(shouldFallback, isFalse);
+    });
+
+    test('retries empty responses stream with non-streaming request', () async {
+      final httpClient = _EmptyResponsesStreamThenJsonClient();
+      final ai = Genkit(
+        isDevEnv: false,
+        promptDir: null,
+        plugins: [
+          openAI(
+            apiKey: 'test-key',
+            baseUrl: 'https://example.test/v1',
+            httpClient: httpClient,
+            models: const <CustomModelDefinition>[
+              CustomModelDefinition(name: 'fallback-model'),
+            ],
+            wireApi: OpenAIWireApi.responses,
+          ),
+        ],
+      );
+      addTearDown(ai.shutdown);
+
+      final stream = ai.generateStream(
+        model: openAI.model('fallback-model'),
+        prompt: 'Reply OK.',
+      );
+      final response = await stream.onResult;
+
+      expect(response.text, 'OK');
+      expect(httpClient.requestBodies, hasLength(2));
+      expect(httpClient.requestBodies.first['stream'], isTrue);
+      expect(httpClient.requestBodies.last['stream'], isNot(isTrue));
+    });
+
+    test('falls back from responses 5xx to chat completions', () async {
+      final httpClient = _ResponsesUnavailableThenChatJsonClient();
+      final ai = Genkit(
+        isDevEnv: false,
+        promptDir: null,
+        plugins: [
+          openAI(
+            apiKey: 'test-key',
+            baseUrl: 'https://example.test/v1',
+            httpClient: httpClient,
+            models: const <CustomModelDefinition>[
+              CustomModelDefinition(name: 'fallback-model'),
+            ],
+            wireApi: OpenAIWireApi.responses,
+          ),
+        ],
+      );
+      addTearDown(ai.shutdown);
+
+      final stream = ai.generateStream(
+        model: openAI.model('fallback-model'),
+        prompt: 'Reply OK.',
+      );
+      final response = await stream.onResult;
+
+      expect(response.text, 'OK');
+      expect(httpClient.requestPaths, <String>[
+        '/v1/responses',
+        '/v1/responses',
+        '/v1/chat/completions',
+      ]);
+    });
+  });
+
+  group('responses to chat completions fallback', () {
+    test('falls back for response 502 before any chunk', () {
+      final shouldFallback = shouldFallbackResponsesToChatCompletionsForTest(
+        error: sdk.ApiException(
+          message: 'Bad gateway',
+          statusCode: 502,
+          requestId: 'req_1',
+        ),
+        receivedAnyChunk: false,
+      );
+
+      expect(shouldFallback, isTrue);
+    });
+
+    test('does not fall back after any streaming chunk was received', () {
+      final shouldFallback = shouldFallbackResponsesToChatCompletionsForTest(
+        error: sdk.ApiException(
+          message: 'Bad gateway',
+          statusCode: 502,
+          requestId: 'req_1',
+        ),
+        receivedAnyChunk: true,
+      );
+
+      expect(shouldFallback, isFalse);
+    });
+
+    test('does not fall back for request validation errors', () {
+      final shouldFallback = shouldFallbackResponsesToChatCompletionsForTest(
+        error: sdk.ApiException(
+          message: 'Invalid request',
+          statusCode: 400,
+          requestId: 'req_1',
+        ),
         receivedAnyChunk: false,
       );
 
@@ -464,7 +586,7 @@ void main() {
 
   group('GenkitConverter.toOpenAIResponseInput', () {
     test('converts mixed message history into responses input items', () {
-      final input = GenkitConverter.toOpenAIResponseInput(<Message>[
+      final messages = <Message>[
         Message(
           role: Role.system,
           content: <Part>[TextPart(text: 'You are helpful.')],
@@ -498,16 +620,41 @@ void main() {
             ),
           ],
         ),
-      ], null);
+      ];
+      final input = GenkitConverter.toOpenAIResponseInput(messages, null);
 
       final json = input.toJson() as List<dynamic>;
-      expect(json, hasLength(5));
-      expect(json[0], containsPair('role', 'system'));
-      expect(json[1], containsPair('role', 'user'));
-      expect(json[2], containsPair('type', 'message'));
-      expect((json[2] as Map<String, dynamic>)['role'], 'assistant');
-      expect(json[3], containsPair('type', 'function_call'));
-      expect(json[4], containsPair('type', 'function_call_output'));
+      expect(json, hasLength(4));
+      expect(json[0], containsPair('role', 'user'));
+      expect(json[1], containsPair('type', 'message'));
+      expect((json[1] as Map<String, dynamic>)['role'], 'assistant');
+      expect(json[2], containsPair('type', 'function_call'));
+      expect(json[3], containsPair('type', 'function_call_output'));
+      expect(
+        GenkitConverter.toOpenAIResponseInstructions(messages),
+        'You are helpful.',
+      );
+    });
+
+    test('combines multiple system messages into instructions', () {
+      final instructions = GenkitConverter.toOpenAIResponseInstructions(
+        <Message>[
+          Message(
+            role: Role.system,
+            content: <Part>[TextPart(text: 'First instruction.')],
+          ),
+          Message(
+            role: Role.user,
+            content: <Part>[TextPart(text: 'Hello')],
+          ),
+          Message(
+            role: Role.system,
+            content: <Part>[TextPart(text: 'Second instruction.')],
+          ),
+        ],
+      );
+
+      expect(instructions, 'First instruction.\n\nSecond instruction.');
     });
   });
 
@@ -701,6 +848,96 @@ void main() {
       expect(event.response.error?.message, 'The provider failed.');
     });
 
+    test('normalizes sparse failed final response payloads', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.failed',
+        'sequence_number': 12,
+        'response': <String, dynamic>{
+          'error': <String, dynamic>{'message': 'Provider returned null.'},
+        },
+      });
+
+      expect(event, isA<sdk.ResponseFailedEvent>());
+      final response = (event as sdk.ResponseFailedEvent).response;
+      expect(response.id, 'resp_stream_12');
+      expect(response.object, 'response');
+      expect(response.createdAt, 0);
+      expect(response.status, sdk.ResponseStatus.failed);
+      expect(response.output, isEmpty);
+      expect(response.error?.message, 'Provider returned null.');
+    });
+
+    test('normalizes response output message items with nullable fields', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.completed',
+        'response': responseJson('completed', <Map<String, dynamic>>[
+          <String, dynamic>{
+            'type': 'message',
+            'id': null,
+            'role': null,
+            'content': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'output_text', 'text': null},
+            ],
+          },
+        ]),
+      });
+
+      expect(event, isA<sdk.ResponseCompletedEvent>());
+      final output = (event as sdk.ResponseCompletedEvent).response.output;
+      expect(output.single, isA<sdk.MessageOutputItem>());
+      final message = output.single as sdk.MessageOutputItem;
+      expect(message.id, 'message_0');
+      expect(message.role, sdk.MessageRole.assistant);
+      expect(message.content.single, isA<sdk.OutputTextContent>());
+      expect((message.content.single as sdk.OutputTextContent).text, isEmpty);
+    });
+
+    test('normalizes output item events with nullable message id', () {
+      final event = responseStreamEventFromJsonForTest(<String, dynamic>{
+        'type': 'response.output_item.done',
+        'output_index': 2,
+        'item': <String, dynamic>{
+          'type': 'message',
+          'id': null,
+          'role': 'assistant',
+          'content': const <Map<String, dynamic>>[],
+        },
+      });
+
+      expect(event, isA<sdk.OutputItemDoneEvent>());
+      final item = (event as sdk.OutputItemDoneEvent).item;
+      expect(item, isA<sdk.MessageOutputItem>());
+      expect((item as sdk.MessageOutputItem).id, 'message_2');
+    });
+
+    test('normalizes non-streaming response JSON with nullable SDK fields', () {
+      final json = normalizeOpenAIResponseJsonForTest(<String, dynamic>{
+        'id': null,
+        'object': null,
+        'created_at': null,
+        'status': null,
+        'metadata': <String, Object?>{'kept': 'yes', 'dropped': null},
+        'output': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'type': 'message',
+            'id': null,
+            'role': null,
+            'content': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'output_text', 'text': null},
+            ],
+          },
+        ],
+      });
+
+      final response = sdk.Response.fromJson(json);
+      expect(response.id, 'resp_test');
+      expect(response.object, 'response');
+      expect(response.createdAt, 0);
+      expect(response.status, sdk.ResponseStatus.completed);
+      expect(response.metadata, <String, String>{'kept': 'yes'});
+      expect(response.output.single, isA<sdk.MessageOutputItem>());
+    });
+
     test('preserves non-empty completed output', () {
       final event = responseStreamEventFromJsonForTest(<String, dynamic>{
         'type': 'response.completed',
@@ -762,6 +999,119 @@ void main() {
 
       expect(rebuilt.output.first, isA<sdk.ReasoningItem>());
       expect(rebuilt.output.last, isA<sdk.FunctionCallOutputItemResponse>());
+    });
+  });
+
+  group('modelResponseFromOpenAIResponseForTest', () {
+    test('throws provider error for failed Responses status', () {
+      expect(
+        () => modelResponseFromOpenAIResponseForTest(
+          const sdk.Response(
+            id: 'resp_failed',
+            object: 'response',
+            createdAt: 0,
+            status: sdk.ResponseStatus.failed,
+            output: <sdk.OutputItem>[],
+            error: sdk.ResponseError(
+              type: 'server_error',
+              code: 'provider_error',
+              message: 'Provider returned a malformed event.',
+            ),
+          ),
+        ),
+        throwsA(
+          isA<GenkitException>()
+              .having(
+                (error) => error.message,
+                'message',
+                contains('Provider returned a malformed event.'),
+              )
+              .having((error) => error.details, 'details', 'provider_error'),
+        ),
+      );
+    });
+  });
+
+  group('modelResponseFromResponsesEventsForTest', () {
+    test('synthesizes final response from created and text done events', () {
+      final response =
+          modelResponseFromResponsesEventsForTest(<sdk.ResponseStreamEvent>[
+            sdk.ResponseCreatedEvent(
+              response: sdk.Response(
+                id: 'resp_1',
+                object: 'response',
+                createdAt: 0,
+                status: sdk.ResponseStatus.inProgress,
+                output: const <sdk.OutputItem>[],
+              ),
+            ),
+            const sdk.OutputTextDoneEvent(
+              itemId: 'msg_1',
+              outputIndex: 0,
+              contentIndex: 0,
+              text: 'Hello from a proxy.',
+            ),
+          ]);
+
+      expect(response.finishReason, FinishReason.stop);
+      expect(response.text, 'Hello from a proxy.');
+      expect(response.raw?['status'], 'completed');
+      expect(response.raw?['output'], isA<List<dynamic>>());
+    });
+
+    test('synthesizes final response from text deltas without lifecycle', () {
+      final response = modelResponseFromResponsesEventsForTest(
+        const <sdk.ResponseStreamEvent>[
+          sdk.OutputTextDeltaEvent(
+            outputIndex: 0,
+            contentIndex: 0,
+            delta: 'Hello ',
+          ),
+          sdk.OutputTextDeltaEvent(
+            outputIndex: 0,
+            contentIndex: 0,
+            delta: 'again.',
+          ),
+        ],
+      );
+
+      expect(response.finishReason, FinishReason.stop);
+      expect(response.text, 'Hello again.');
+    });
+
+    test('synthesizes final response from item done without lifecycle', () {
+      final response = modelResponseFromResponsesEventsForTest(
+        <sdk.ResponseStreamEvent>[
+          sdk.OutputItemDoneEvent(
+            outputIndex: 0,
+            item: sdk.MessageOutputItem(
+              id: 'msg_1',
+              role: sdk.MessageRole.assistant,
+              content: const <sdk.OutputContent>[
+                sdk.OutputTextContent(text: 'Item-only final.'),
+              ],
+            ),
+          ),
+        ],
+      );
+
+      expect(response.finishReason, FinishReason.stop);
+      expect(response.text, 'Item-only final.');
+    });
+
+    test('still throws when stream has no final response and no output', () {
+      expect(
+        () => modelResponseFromResponsesEventsForTest(
+          const <sdk.ResponseStreamEvent>[],
+        ),
+        throwsA(
+          isA<GenkitException>().having(
+            (error) => error.message,
+            'message',
+            contains('Responses stream ended without a final response'),
+          ),
+        ),
+      );
     });
   });
 
@@ -962,4 +1312,128 @@ void main() {
       expect(GenkitConverter.mapFinishReason(null), FinishReason.unknown);
     });
   });
+}
+
+final class _EmptyResponsesStreamThenJsonClient extends http.BaseClient {
+  final List<Map<String, dynamic>> requestBodies = <Map<String, dynamic>>[];
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final body = await _requestBody(request);
+    requestBodies.add(body);
+    if (body['stream'] == true) {
+      return http.StreamedResponse(
+        const Stream<List<int>>.empty(),
+        200,
+        headers: const <String, String>{'content-type': 'text/event-stream'},
+        request: request,
+      );
+    }
+
+    final bytes = utf8.encode(
+      jsonEncode(<String, dynamic>{
+        'id': 'resp_fallback',
+        'object': 'response',
+        'created_at': 0,
+        'status': 'completed',
+        'output': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'id': 'msg_1',
+            'type': 'message',
+            'role': 'assistant',
+            'content': <Map<String, dynamic>>[
+              <String, dynamic>{'type': 'output_text', 'text': 'OK'},
+            ],
+          },
+        ],
+      }),
+    );
+    return http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      200,
+      headers: const <String, String>{'content-type': 'application/json'},
+      request: request,
+    );
+  }
+
+  Future<Map<String, dynamic>> _requestBody(http.BaseRequest request) async {
+    if (request is! http.Request || request.body.isEmpty) {
+      return const <String, dynamic>{};
+    }
+    return jsonDecode(request.body) as Map<String, dynamic>;
+  }
+}
+
+final class _ResponsesUnavailableThenChatJsonClient extends http.BaseClient {
+  final List<String> requestPaths = <String>[];
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    requestPaths.add(request.url.path);
+    if (request.url.path.endsWith('/responses')) {
+      final body = await _requestBody(request);
+      if (body['stream'] == true) {
+        return http.StreamedResponse(
+          const Stream<List<int>>.empty(),
+          200,
+          headers: const <String, String>{'content-type': 'text/event-stream'},
+          request: request,
+        );
+      }
+      return _textResponse(request, 502, 'Bad gateway');
+    }
+
+    if (request.url.path.endsWith('/chat/completions')) {
+      return _jsonResponse(request, 200, <String, dynamic>{
+        'id': 'chatcmpl_fallback',
+        'object': 'chat.completion',
+        'created': 0,
+        'model': 'fallback-model',
+        'choices': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'index': 0,
+            'message': <String, dynamic>{'role': 'assistant', 'content': 'OK'},
+            'finish_reason': 'stop',
+          },
+        ],
+      });
+    }
+
+    return _jsonResponse(request, 404, <String, dynamic>{
+      'error': <String, dynamic>{'message': 'Unexpected endpoint'},
+    });
+  }
+}
+
+http.StreamedResponse _jsonResponse(
+  http.BaseRequest request,
+  int statusCode,
+  Map<String, dynamic> body,
+) {
+  return http.StreamedResponse(
+    Stream<List<int>>.value(utf8.encode(jsonEncode(body))),
+    statusCode,
+    headers: const <String, String>{'content-type': 'application/json'},
+    request: request,
+  );
+}
+
+http.StreamedResponse _textResponse(
+  http.BaseRequest request,
+  int statusCode,
+  String body,
+) {
+  return http.StreamedResponse(
+    Stream<List<int>>.value(utf8.encode(body)),
+    statusCode,
+    headers: const <String, String>{'content-type': 'text/plain'},
+    request: request,
+  );
+}
+
+Future<Map<String, dynamic>> _requestBody(http.BaseRequest request) async {
+  if (request is! http.Request || request.body.isEmpty) {
+    return const <String, dynamic>{};
+  }
+  return jsonDecode(request.body) as Map<String, dynamic>;
 }

@@ -68,9 +68,35 @@ abstract final class GenkitConverter {
   ) {
     final itemMaps = <Map<String, dynamic>>[];
     for (final message in messages) {
+      if (message.role == Role.system) {
+        continue;
+      }
       itemMaps.addAll(_toOpenAIResponseItemMaps(message, visualDetailLevel));
     }
     return sdk.ResponseInput.fromOutputItems(itemMaps);
+  }
+
+  /// Convert Genkit system messages to the Responses API instructions field.
+  static String? toOpenAIResponseInstructions(List<Message> messages) {
+    final sections = <String>[];
+    for (final message in messages) {
+      if (message.role != Role.system) {
+        continue;
+      }
+      final text = message.content
+          .where((part) => part.isText)
+          .map((part) => part.text!.trim())
+          .where((text) => text.isNotEmpty)
+          .join('\n')
+          .trim();
+      if (text.isNotEmpty) {
+        sections.add(text);
+      }
+    }
+    if (sections.isEmpty) {
+      return null;
+    }
+    return sections.join('\n\n');
   }
 
   /// Convert a single Genkit message to OpenAI format
@@ -415,11 +441,15 @@ abstract final class GenkitConverter {
     Message message,
     String? visualDetailLevel,
   ) {
-    if (message.role == Role.system || message.role == Role.user) {
+    if (message.role == Role.system) {
+      return const <Map<String, dynamic>>[];
+    }
+
+    if (message.role == Role.user) {
       return <Map<String, dynamic>>[
         <String, dynamic>{
           'type': 'message',
-          'role': message.role == Role.system ? 'system' : 'user',
+          'role': 'user',
           'content': message.content
               .map(
                 (part) => _toOpenAIResponseContentPartMap(

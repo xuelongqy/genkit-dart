@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import 'dart:convert';
+
 import 'package:genkit/plugin.dart';
 import 'package:http/http.dart' as http;
 import 'package:meta/meta.dart';
@@ -259,10 +261,41 @@ class OpenAIPlugin extends GenkitPlugin {
           final responseFormat = chat.buildOpenAIResponseFormat(
             modelRequest.output?.schema,
           );
+          sdk.ChatCompletionCreateRequest buildChatCompletionsRequest() {
+            return sdk.ChatCompletionCreateRequest(
+              model: options.version ?? modelName,
+              messages: GenkitConverter.toOpenAIMessages(
+                modelRequest.messages,
+                options.visualDetailLevel,
+              ),
+              tools: supportsTools
+                  ? modelRequest.tools
+                        ?.map(GenkitConverter.toOpenAITool)
+                        .toList()
+                  : null,
+              temperature: options.temperature,
+              topP: options.topP,
+              maxCompletionTokens: options.maxTokens,
+              stop: options.stop,
+              presencePenalty: options.presencePenalty,
+              frequencyPenalty: options.frequencyPenalty,
+              seed: options.seed,
+              user: options.user,
+              reasoningEffort: _mapReasoningEffort(options.reasoningEffort),
+              openRouterReasoning: _mapOpenRouterReasoning(
+                options.reasoningSummary,
+              ),
+              responseFormat: isJsonMode ? responseFormat : null,
+            );
+          }
+
           switch (wireApi) {
             case OpenAIWireApi.responses:
               final request = sdk.CreateResponseRequest(
                 model: options.version ?? modelName,
+                instructions: GenkitConverter.toOpenAIResponseInstructions(
+                  modelRequest.messages,
+                ),
                 input: GenkitConverter.toOpenAIResponseInput(
                   modelRequest.messages,
                   options.visualDetailLevel,
@@ -285,35 +318,43 @@ class OpenAIPlugin extends GenkitPlugin {
                 ),
               );
               if (ctx.streamingRequested) {
-                return await _handleResponsesStreaming(client, request, ctx);
+                var receivedAnyChunk = false;
+                try {
+                  return await _handleResponsesStreaming(
+                    client,
+                    request,
+                    ctx,
+                    onChunkReceived: () => receivedAnyChunk = true,
+                  );
+                } catch (error) {
+                  if (!_shouldFallbackResponsesToChatCompletions(
+                    error: error,
+                    receivedAnyChunk: receivedAnyChunk,
+                  )) {
+                    rethrow;
+                  }
+                  return _handleNonStreamingWithReasoningSummaryFallback(
+                    client,
+                    buildChatCompletionsRequest(),
+                  );
+                }
               }
-              return await _handleResponsesNonStreaming(client, request);
+              try {
+                return await _handleResponsesNonStreaming(client, request);
+              } catch (error) {
+                if (!_shouldFallbackResponsesToChatCompletions(
+                  error: error,
+                  receivedAnyChunk: false,
+                )) {
+                  rethrow;
+                }
+                return _handleNonStreamingWithReasoningSummaryFallback(
+                  client,
+                  buildChatCompletionsRequest(),
+                );
+              }
             case OpenAIWireApi.chatCompletions:
-              final request = sdk.ChatCompletionCreateRequest(
-                model: options.version ?? modelName,
-                messages: GenkitConverter.toOpenAIMessages(
-                  modelRequest.messages,
-                  options.visualDetailLevel,
-                ),
-                tools: supportsTools
-                    ? modelRequest.tools
-                          ?.map(GenkitConverter.toOpenAITool)
-                          .toList()
-                    : null,
-                temperature: options.temperature,
-                topP: options.topP,
-                maxCompletionTokens: options.maxTokens,
-                stop: options.stop,
-                presencePenalty: options.presencePenalty,
-                frequencyPenalty: options.frequencyPenalty,
-                seed: options.seed,
-                user: options.user,
-                reasoningEffort: _mapReasoningEffort(options.reasoningEffort),
-                openRouterReasoning: _mapOpenRouterReasoning(
-                  options.reasoningSummary,
-                ),
-                responseFormat: isJsonMode ? responseFormat : null,
-              );
+              final request = buildChatCompletionsRequest();
               if (ctx.streamingRequested) {
                 return await _handleStreamingWithReasoningSummaryFallback(
                   client,
@@ -483,11 +524,19 @@ class OpenAIPlugin extends GenkitPlugin {
       Stream<ModelRequest>? inputStream,
       void init,
     })
-    ctx,
-  ) async {
+    ctx, {
+    void Function()? onChunkReceived,
+  }) async {
     sdk.Response? finalResponse;
     final seenSummarySections = <String>{};
     final streamState = _ResponsesStreamState();
+    var receivedAnyChunk = false;
+
+    void sendChunk(ModelResponseChunk chunk) {
+      receivedAnyChunk = true;
+      onChunkReceived?.call();
+      ctx.sendChunk(chunk);
+    }
 
     try {
       await for (final event in _createResponsesStream(client, request)) {
@@ -499,7 +548,7 @@ class OpenAIPlugin extends GenkitPlugin {
               streamState,
             );
             if (parts.isNotEmpty) {
-              ctx.sendChunk(ModelResponseChunk(index: 0, content: parts));
+              sendChunk(ModelResponseChunk(index: 0, content: parts));
             }
           case sdk.OutputTextDoneEvent():
             final parts = _assistantTextPartsFromResponsesEvent(
@@ -507,7 +556,7 @@ class OpenAIPlugin extends GenkitPlugin {
               streamState,
             );
             if (parts.isNotEmpty) {
-              ctx.sendChunk(ModelResponseChunk(index: 0, content: parts));
+              sendChunk(ModelResponseChunk(index: 0, content: parts));
             }
           case sdk.ContentPartDoneEvent():
             final parts = _assistantTextPartsFromResponsesEvent(
@@ -515,7 +564,7 @@ class OpenAIPlugin extends GenkitPlugin {
               streamState,
             );
             if (parts.isNotEmpty) {
-              ctx.sendChunk(ModelResponseChunk(index: 0, content: parts));
+              sendChunk(ModelResponseChunk(index: 0, content: parts));
             }
           case sdk.ReasoningSummaryTextDeltaEvent(
             :final itemId,
@@ -528,7 +577,7 @@ class OpenAIPlugin extends GenkitPlugin {
             }
             final sectionKey = '${itemId ?? outputIndex}:$summaryIndex';
             final isNewSection = seenSummarySections.add(sectionKey);
-            ctx.sendChunk(
+            sendChunk(
               ModelResponseChunk(
                 index: 0,
                 content: <Part>[
@@ -549,7 +598,7 @@ class OpenAIPlugin extends GenkitPlugin {
               streamState,
             );
             if (parts.isNotEmpty) {
-              ctx.sendChunk(ModelResponseChunk(index: 0, content: parts));
+              sendChunk(ModelResponseChunk(index: 0, content: parts));
             }
           case sdk.ResponseCompletedEvent(:final response):
             finalResponse = response;
@@ -569,6 +618,12 @@ class OpenAIPlugin extends GenkitPlugin {
       }
     } catch (e, stackTrace) {
       if (e is GenkitException) rethrow;
+      if (_shouldFallbackStreamingToNonStreaming(
+        error: e,
+        receivedAnyChunk: receivedAnyChunk,
+      )) {
+        return _handleResponsesNonStreaming(client, request);
+      }
       throw GenkitException(
         'Error in responses streaming: $e',
         underlyingException: e,
@@ -576,9 +631,21 @@ class OpenAIPlugin extends GenkitPlugin {
       );
     }
 
-    final response = finalResponse;
+    final response = _finalResponseForResponsesStream(
+      finalResponse,
+      streamState,
+    );
     if (response == null) {
-      throw GenkitException('Responses stream ended without a final response.');
+      final error = GenkitException(
+        'Responses stream ended without a final response.',
+      );
+      if (_shouldFallbackStreamingToNonStreaming(
+        error: error,
+        receivedAnyChunk: receivedAnyChunk,
+      )) {
+        return _handleResponsesNonStreaming(client, request);
+      }
+      throw error;
     }
     return _modelResponseFromOpenAIResponse(
       _rebuildResponseFromResponsesStream(response, streamState),
@@ -601,11 +668,54 @@ class OpenAIPlugin extends GenkitPlugin {
     sdk.OpenAIClient client,
     sdk.CreateResponseRequest request,
   ) async {
-    final response = await client.responses.create(request);
+    final response = await _createResponse(client, request);
     return _modelResponseFromOpenAIResponse(response);
   }
 
+  Future<sdk.Response> _createResponse(
+    sdk.OpenAIClient client,
+    sdk.CreateResponseRequest request,
+  ) async {
+    final url = _buildOpenAIUrl(client.config.baseUrl, '/responses');
+    final httpRequest = http.Request('POST', url)
+      ..headers.addAll(_buildOpenAIHeaders(client.config))
+      ..body = jsonEncode(request.toJson());
+    final httpResponse = await client.interceptorChain.execute(httpRequest);
+    if (httpResponse.statusCode >= 400) {
+      _throwOpenAIHttpError(httpResponse);
+    }
+    final decoded = jsonDecode(httpResponse.body) as Map<String, dynamic>;
+    return sdk.Response.fromJson(
+      _normalizeOpenAIResponseJson(
+        decoded,
+        fallbackStatus: 'completed',
+        fallbackId: _nonEmptyString(decoded['id']) ?? 'resp_non_streaming',
+      ),
+    );
+  }
+
+  Never _throwOpenAIHttpError(http.Response response) {
+    final decoded = _tryDecodeJsonObject(response.body);
+    final error = _stringKeyedMap(decoded?['error']);
+    final fallbackMessage = response.body.trim().isNotEmpty
+        ? response.body.trim()
+        : 'Provider returned ${response.statusCode} ${response.reasonPhrase ?? ''}'
+              .trim();
+    throw sdk.ApiException(
+      message: _nonEmptyString(error?['message']) ?? fallbackMessage,
+      statusCode: response.statusCode,
+      type: _nonEmptyString(error?['type']),
+      code: _nonEmptyString(error?['code']),
+      param: _nonEmptyString(error?['param']),
+      requestId: response.headers['x-request-id'],
+      body: decoded,
+    );
+  }
+
   ModelResponse _modelResponseFromOpenAIResponse(sdk.Response response) {
+    if (response.status == sdk.ResponseStatus.failed) {
+      throw _responsesFailureException(response);
+    }
     return ModelResponse(
       finishReason: GenkitConverter.mapResponseFinishReason(response),
       finishMessage: _finishMessageFromOpenAIResponse(response),
@@ -622,6 +732,16 @@ class OpenAIPlugin extends GenkitPlugin {
       return response.incompleteDetails?.reason;
     }
     return null;
+  }
+
+  GenkitException _responsesFailureException(sdk.Response response) {
+    final error = response.error;
+    final message = error?.message ?? 'Response ${response.id} failed.';
+    return GenkitException(
+      'OpenAI Responses API error: $message',
+      status: StatusCodes.INTERNAL,
+      details: error?.code ?? error?.type,
+    );
   }
 
   Future<ModelResponse> _handleNonStreamingWithReasoningSummaryFallback(
@@ -828,6 +948,37 @@ sdk.ResponseStreamEvent responseStreamEventFromJsonForTest(
   Map<String, dynamic> json,
 ) => _responseStreamEventFromJson(json);
 
+@visibleForTesting
+ModelResponse modelResponseFromOpenAIResponseForTest(sdk.Response response) {
+  return OpenAIPlugin()._modelResponseFromOpenAIResponse(response);
+}
+
+@visibleForTesting
+ModelResponse modelResponseFromResponsesEventsForTest(
+  Iterable<sdk.ResponseStreamEvent> events,
+) {
+  final state = _ResponsesStreamState();
+  sdk.Response? finalResponse;
+  for (final event in events) {
+    state.add(event);
+    switch (event) {
+      case sdk.ResponseCompletedEvent(:final response):
+      case sdk.ResponseIncompleteEvent(:final response):
+      case sdk.ResponseFailedEvent(:final response):
+        finalResponse = response;
+      default:
+        break;
+    }
+  }
+  final response = _finalResponseForResponsesStream(finalResponse, state);
+  if (response == null) {
+    throw GenkitException('Responses stream ended without a final response.');
+  }
+  return OpenAIPlugin()._modelResponseFromOpenAIResponse(
+    _rebuildResponseFromResponsesStream(response, state),
+  );
+}
+
 sdk.ResponseStreamEvent _responseStreamEventFromJson(
   Map<String, dynamic> json,
 ) {
@@ -840,19 +991,327 @@ Map<String, dynamic> _normalizeResponseStreamEventJson(
   Map<String, dynamic> json,
 ) {
   final type = json['type'];
-  if (type != 'response.completed' &&
-      type != 'response.incomplete' &&
-      type != 'response.failed') {
+  if (type == 'response.output_item.added' ||
+      type == 'response.output_item.done') {
+    final item = _stringKeyedMap(json['item']);
+    if (item == null) {
+      return json;
+    }
+    final normalizedItem = _normalizeResponseOutputItemJson(
+      item,
+      fallbackIndex: _intValue(json['output_index']) ?? 0,
+    );
+    if (normalizedItem == null) {
+      return json;
+    }
+    return <String, dynamic>{...json, 'item': normalizedItem};
+  }
+
+  final fallbackStatus = _statusForResponseStreamEvent(type);
+  if (fallbackStatus == null) {
     return json;
   }
-  final response = json['response'];
-  if (response is! Map<String, dynamic> || response['output'] != null) {
-    return json;
-  }
+  final response = _stringKeyedMap(json['response']) ?? <String, dynamic>{};
+  final fallbackId =
+      _nonEmptyString(response['id']) ??
+      _nonEmptyString(json['response_id']) ??
+      _nonEmptyString(json['id']) ??
+      'resp_stream_${_intValue(json['sequence_number']) ?? type}';
   return <String, dynamic>{
     ...json,
-    'response': <String, dynamic>{...response, 'output': const <Object?>[]},
+    'response': _normalizeOpenAIResponseJson(
+      response,
+      fallbackStatus: fallbackStatus,
+      fallbackId: fallbackId,
+    ),
   };
+}
+
+@visibleForTesting
+Map<String, dynamic> normalizeOpenAIResponseJsonForTest(
+  Map<String, dynamic> json, {
+  String fallbackStatus = 'completed',
+  String fallbackId = 'resp_test',
+}) => _normalizeOpenAIResponseJson(
+  json,
+  fallbackStatus: fallbackStatus,
+  fallbackId: fallbackId,
+);
+
+Uri _buildOpenAIUrl(String baseUrl, String path) {
+  final baseUri = Uri.parse(baseUrl);
+  final basePath = baseUri.path.endsWith('/')
+      ? baseUri.path.substring(0, baseUri.path.length - 1)
+      : baseUri.path;
+  final normalizedPath = path.startsWith('/') ? path : '/$path';
+  return baseUri.replace(
+    path: '$basePath$normalizedPath',
+    queryParameters: baseUri.queryParameters.isEmpty
+        ? null
+        : baseUri.queryParameters,
+  );
+}
+
+Map<String, String> _buildOpenAIHeaders(sdk.OpenAIConfig config) {
+  final headers = <String, String>{
+    'Content-Type': 'application/json',
+    ...config.defaultHeaders,
+  };
+  final apiVersion = _nonEmptyString(config.apiVersion);
+  if (apiVersion != null) {
+    headers['OpenAI-Version'] = apiVersion;
+  }
+  final organization = _nonEmptyString(config.organization);
+  if (organization != null) {
+    headers['OpenAI-Organization'] = organization;
+  }
+  final project = _nonEmptyString(config.project);
+  if (project != null) {
+    headers['OpenAI-Project'] = project;
+  }
+  return headers;
+}
+
+String? _statusForResponseStreamEvent(Object? type) {
+  return switch (type) {
+    'response.created' => 'in_progress',
+    'response.queued' => 'queued',
+    'response.in_progress' => 'in_progress',
+    'response.completed' => 'completed',
+    'response.incomplete' => 'incomplete',
+    'response.failed' => 'failed',
+    _ => null,
+  };
+}
+
+Map<String, dynamic> _normalizeOpenAIResponseJson(
+  Map<String, dynamic> json, {
+  required String fallbackStatus,
+  required String fallbackId,
+}) {
+  final normalized = <String, dynamic>{...json};
+  final error = _stringKeyedMap(normalized['error']);
+  normalized['id'] = _nonEmptyString(normalized['id']) ?? fallbackId;
+  normalized['object'] = _nonEmptyString(normalized['object']) ?? 'response';
+  normalized['created_at'] = _intValue(normalized['created_at']) ?? 0;
+  normalized['status'] =
+      _nonEmptyString(normalized['status']) ??
+      (error == null ? fallbackStatus : 'failed');
+  normalized['output'] = _normalizeResponseOutputJson(normalized['output']);
+
+  final metadata = _stringKeyedMap(normalized['metadata']);
+  if (metadata == null) {
+    normalized.remove('metadata');
+  } else {
+    normalized['metadata'] = <String, String>{
+      for (final entry in metadata.entries)
+        if (entry.value != null) entry.key: entry.value.toString(),
+    };
+  }
+
+  if (error != null) {
+    normalized['error'] = _normalizeResponseErrorJson(error);
+  } else if (normalized['status'] == 'failed') {
+    normalized['error'] = const <String, dynamic>{
+      'type': 'error',
+      'message': 'OpenAI Responses API request failed.',
+    };
+  }
+
+  return normalized;
+}
+
+Map<String, dynamic> _normalizeResponseErrorJson(Map<String, dynamic> json) {
+  final normalized = <String, dynamic>{
+    'type': _nonEmptyString(json['type']) ?? 'error',
+    'message':
+        _nonEmptyString(json['message']) ??
+        'OpenAI Responses API request failed.',
+  };
+  final code = _nonEmptyString(json['code']);
+  if (code != null) {
+    normalized['code'] = code;
+  }
+  final param = _nonEmptyString(json['param']);
+  if (param != null) {
+    normalized['param'] = param;
+  }
+  return normalized;
+}
+
+List<Object?> _normalizeResponseOutputJson(Object? output) {
+  if (output is! List) {
+    return const <Object?>[];
+  }
+  final normalized = <Object?>[];
+  for (var i = 0; i < output.length; i += 1) {
+    final item = _stringKeyedMap(output[i]);
+    if (item == null) {
+      continue;
+    }
+    final normalizedItem = _normalizeResponseOutputItemJson(
+      item,
+      fallbackIndex: i,
+    );
+    if (normalizedItem != null) {
+      normalized.add(normalizedItem);
+    }
+  }
+  return normalized;
+}
+
+Map<String, dynamic>? _normalizeResponseOutputItemJson(
+  Map<String, dynamic> item, {
+  required int fallbackIndex,
+}) {
+  final type = _nonEmptyString(item['type']);
+  if (type == null) {
+    return null;
+  }
+  final normalized = <String, dynamic>{...item, 'type': type};
+  normalized['id'] =
+      _nonEmptyString(normalized['id']) ?? '${type}_$fallbackIndex';
+
+  switch (type) {
+    case 'message':
+      normalized['role'] = _nonEmptyString(normalized['role']) ?? 'assistant';
+      normalized['content'] = _normalizeOutputContentJson(
+        normalized['content'],
+      );
+      if (_nonEmptyString(normalized['status']) == null) {
+        normalized.remove('status');
+      }
+      if (_nonEmptyString(normalized['phase']) == null) {
+        normalized.remove('phase');
+      }
+    case 'function_call':
+      normalized['call_id'] =
+          _nonEmptyString(normalized['call_id']) ??
+          _nonEmptyString(normalized['id']) ??
+          'call_$fallbackIndex';
+      normalized['name'] =
+          _nonEmptyString(normalized['name']) ?? 'unknown_function';
+      normalized['arguments'] = _jsonString(
+        normalized['arguments'],
+        defaultValue: '{}',
+      );
+    case 'reasoning':
+      normalized['summary'] = _normalizeReasoningSummaryJson(
+        normalized['summary'],
+      );
+      if (normalized['content'] is! List) {
+        normalized.remove('content');
+      }
+    default:
+      break;
+  }
+
+  return normalized;
+}
+
+List<Object?> _normalizeOutputContentJson(Object? content) {
+  if (content is! List) {
+    return const <Object?>[];
+  }
+  final normalized = <Object?>[];
+  for (final entry in content) {
+    final item = _stringKeyedMap(entry);
+    if (item == null) {
+      continue;
+    }
+    final type = _nonEmptyString(item['type']);
+    if (type == null) {
+      continue;
+    }
+    final normalizedItem = <String, dynamic>{...item, 'type': type};
+    switch (type) {
+      case 'output_text':
+      case 'reasoning_text':
+      case 'summary_text':
+      case 'input_text':
+        normalizedItem['text'] = _nonEmptyString(normalizedItem['text']) ?? '';
+        if (normalizedItem['annotations'] is! List) {
+          normalizedItem.remove('annotations');
+        }
+        if (normalizedItem['logprobs'] is! List) {
+          normalizedItem.remove('logprobs');
+        }
+      case 'refusal':
+        normalizedItem['refusal'] =
+            _nonEmptyString(normalizedItem['refusal']) ?? '';
+      default:
+        break;
+    }
+    normalized.add(normalizedItem);
+  }
+  return normalized;
+}
+
+List<Object?> _normalizeReasoningSummaryJson(Object? summary) {
+  if (summary is! List) {
+    return const <Object?>[];
+  }
+  final normalized = <Object?>[];
+  for (final entry in summary) {
+    final item = _stringKeyedMap(entry);
+    if (item == null) {
+      continue;
+    }
+    normalized.add(<String, dynamic>{
+      ...item,
+      'type': _nonEmptyString(item['type']) ?? 'summary_text',
+      'text': _nonEmptyString(item['text']) ?? '',
+    });
+  }
+  return normalized;
+}
+
+Map<String, dynamic>? _stringKeyedMap(Object? value) {
+  if (value is! Map) {
+    return null;
+  }
+  return <String, dynamic>{
+    for (final entry in value.entries)
+      if (entry.key is String) entry.key as String: entry.value,
+  };
+}
+
+Map<String, dynamic>? _tryDecodeJsonObject(String value) {
+  try {
+    return _stringKeyedMap(jsonDecode(value));
+  } catch (_) {
+    return null;
+  }
+}
+
+String? _nonEmptyString(Object? value) {
+  if (value is! String) {
+    return null;
+  }
+  final trimmed = value.trim();
+  return trimmed.isEmpty ? null : trimmed;
+}
+
+int? _intValue(Object? value) {
+  return switch (value) {
+    int() => value,
+    num() => value.toInt(),
+    _ => null,
+  };
+}
+
+String _jsonString(Object? value, {String defaultValue = ''}) {
+  if (value is String) {
+    return value.isEmpty ? defaultValue : value;
+  }
+  if (value == null) {
+    return defaultValue;
+  }
+  try {
+    return jsonEncode(value);
+  } catch (_) {
+    return value.toString();
+  }
 }
 
 @visibleForTesting
@@ -875,6 +1334,16 @@ List<String> assistantTextChunksFromResponsesEventsForTest(
   return assistantTextPartsFromResponsesEventsForTest(
     events,
   ).where((part) => part.text.isNotEmpty).map((part) => part.text).toList();
+}
+
+sdk.Response? _finalResponseForResponsesStream(
+  sdk.Response? finalResponse,
+  _ResponsesStreamState state,
+) {
+  if (finalResponse != null) {
+    return finalResponse;
+  }
+  return state.synthesizeCompletedResponse();
 }
 
 List<TextPart> _assistantTextPartsFromResponsesEvent(
@@ -938,23 +1407,79 @@ bool _sameOutputAsResponse(
 }
 
 final class _ResponsesStreamState {
+  sdk.Response? _latestLifecycleResponse;
   final Map<int, sdk.OutputItem> _addedItems = <int, sdk.OutputItem>{};
   final Map<int, sdk.OutputItem> _completedItems = <int, sdk.OutputItem>{};
   final Map<int, sdk.FunctionCallArgumentsDoneEvent> _functionCalls =
       <int, sdk.FunctionCallArgumentsDoneEvent>{};
+  final Map<int, Map<int, _StreamedTextAccumulator>> _textContent =
+      <int, Map<int, _StreamedTextAccumulator>>{};
   final Set<String> _emittedTextPartKeys = <String>{};
 
   bool get hasRecoveredOutput =>
-      _completedItems.isNotEmpty || _functionCalls.isNotEmpty;
+      _completedItems.isNotEmpty ||
+      _functionCalls.isNotEmpty ||
+      _textContent.values.any(
+        (parts) => parts.values.any((part) => part.text.isNotEmpty),
+      );
 
   void add(sdk.ResponseStreamEvent event) {
     switch (event) {
+      case sdk.ResponseCreatedEvent(:final response):
+      case sdk.ResponseQueuedEvent(:final response):
+      case sdk.ResponseInProgressEvent(:final response):
+        _latestLifecycleResponse = response;
       case sdk.OutputItemAddedEvent(:final outputIndex, :final item):
         _addedItems[outputIndex] = item;
       case sdk.OutputItemDoneEvent(:final outputIndex, :final item):
         _completedItems[outputIndex] = item;
       case sdk.FunctionCallArgumentsDoneEvent(:final outputIndex):
         _functionCalls[outputIndex] = event;
+      case sdk.OutputTextDeltaEvent(
+        :final outputIndex,
+        :final contentIndex,
+        :final itemId,
+        :final delta,
+      ):
+        if (delta.isNotEmpty) {
+          _recordText(
+            outputIndex: outputIndex,
+            contentIndex: contentIndex,
+            itemId: itemId,
+            text: delta,
+            complete: false,
+          );
+        }
+      case sdk.OutputTextDoneEvent(
+        :final outputIndex,
+        :final contentIndex,
+        :final itemId,
+        :final text,
+      ):
+        if (text.isNotEmpty) {
+          _recordText(
+            outputIndex: outputIndex,
+            contentIndex: contentIndex,
+            itemId: itemId,
+            text: text,
+            complete: true,
+          );
+        }
+      case sdk.ContentPartDoneEvent(
+        :final outputIndex,
+        :final contentIndex,
+        :final itemId,
+        :final part,
+      ):
+        if (part is sdk.OutputTextContent && part.text.isNotEmpty) {
+          _recordText(
+            outputIndex: outputIndex,
+            contentIndex: contentIndex,
+            itemId: itemId,
+            text: part.text,
+            complete: true,
+          );
+        }
       default:
         break;
     }
@@ -1106,6 +1631,15 @@ final class _ResponsesStreamState {
     for (final entry in _completedItems.entries) {
       merged[entry.key] = entry.value;
     }
+    for (final entry in _textContent.entries) {
+      if (merged.containsKey(entry.key)) {
+        continue;
+      }
+      final synthesized = _synthesizedMessageFor(entry.key, entry.value);
+      if (synthesized != null) {
+        merged[entry.key] = synthesized;
+      }
+    }
     for (final entry in _functionCalls.entries) {
       if (merged.containsKey(entry.key)) {
         continue;
@@ -1117,6 +1651,74 @@ final class _ResponsesStreamState {
     }
     final orderedKeys = merged.keys.toList()..sort();
     return orderedKeys.map((key) => merged[key]!).toList(growable: false);
+  }
+
+  sdk.Response? synthesizeCompletedResponse() {
+    if (!hasRecoveredOutput) {
+      return null;
+    }
+    final base = _latestLifecycleResponse;
+    final synthesized = sdk.Response.fromJson(<String, dynamic>{
+      if (base != null) ...base.toJson(),
+      'id': base?.id ?? 'resp_stream_synthesized',
+      'object': base?.object ?? 'response',
+      'created_at': base?.createdAt ?? 0,
+      'status': 'completed',
+      'output': const <Object?>[],
+    });
+    return _rebuildResponseFromResponsesStream(synthesized, this);
+  }
+
+  void _recordText({
+    required int outputIndex,
+    required int contentIndex,
+    required String? itemId,
+    required String text,
+    required bool complete,
+  }) {
+    final parts = _textContent.putIfAbsent(
+      outputIndex,
+      () => <int, _StreamedTextAccumulator>{},
+    );
+    final accumulator = parts.putIfAbsent(
+      contentIndex,
+      _StreamedTextAccumulator.new,
+    );
+    accumulator.record(itemId: itemId, text: text, complete: complete);
+  }
+
+  sdk.MessageOutputItem? _synthesizedMessageFor(
+    int outputIndex,
+    Map<int, _StreamedTextAccumulator> parts,
+  ) {
+    final contentEntries =
+        parts.entries
+            .where((entry) => entry.value.text.isNotEmpty)
+            .toList(growable: false)
+          ..sort((a, b) => a.key.compareTo(b.key));
+    if (contentEntries.isEmpty) {
+      return null;
+    }
+    final addedItem = _addedItems[outputIndex];
+    final addedMessage = addedItem is sdk.MessageOutputItem ? addedItem : null;
+    String? streamedItemId;
+    for (final entry in contentEntries) {
+      final itemId = entry.value.itemId;
+      if (itemId != null && itemId.isNotEmpty) {
+        streamedItemId = itemId;
+        break;
+      }
+    }
+    final itemId = streamedItemId ?? addedMessage?.id ?? 'msg_$outputIndex';
+    return sdk.MessageOutputItem(
+      id: itemId,
+      role: addedMessage?.role ?? sdk.MessageRole.assistant,
+      phase: addedMessage?.phase,
+      status: addedMessage?.status,
+      content: contentEntries
+          .map((entry) => sdk.OutputTextContent(text: entry.value.text))
+          .toList(growable: false),
+    );
   }
 
   sdk.FunctionCallOutputItemResponse? _synthesizedFunctionCallFor(
@@ -1156,6 +1758,30 @@ final class _ResponsesStreamState {
   }
 }
 
+final class _StreamedTextAccumulator {
+  final StringBuffer _deltaText = StringBuffer();
+  String? _doneText;
+  String? itemId;
+
+  String get text => _doneText ?? _deltaText.toString();
+
+  void record({
+    required String? itemId,
+    required String text,
+    required bool complete,
+  }) {
+    final normalizedItemId = itemId?.trim();
+    if (normalizedItemId != null && normalizedItemId.isNotEmpty) {
+      this.itemId = normalizedItemId;
+    }
+    if (complete) {
+      _doneText = text;
+    } else {
+      _deltaText.write(text);
+    }
+  }
+}
+
 final class _StreamedAssistantTextChunk {
   const _StreamedAssistantTextChunk({
     required this.text,
@@ -1179,6 +1805,15 @@ bool shouldFallbackStreamingToNonStreamingForTest({
   receivedAnyChunk: receivedAnyChunk,
 );
 
+@visibleForTesting
+bool shouldFallbackResponsesToChatCompletionsForTest({
+  required Object error,
+  required bool receivedAnyChunk,
+}) => _shouldFallbackResponsesToChatCompletions(
+  error: error,
+  receivedAnyChunk: receivedAnyChunk,
+);
+
 bool _shouldFallbackStreamingToNonStreaming({
   required Object error,
   required bool receivedAnyChunk,
@@ -1189,9 +1824,32 @@ bool _shouldFallbackStreamingToNonStreaming({
   if (error is http.ClientException) {
     return true;
   }
-  return error.toString().toLowerCase().contains(
-    'stream finished without a final result chunk',
-  );
+  final text = error.toString().toLowerCase();
+  return text.contains('stream finished without a final result chunk') ||
+      text.contains('responses stream ended without a final response');
+}
+
+bool _shouldFallbackResponsesToChatCompletions({
+  required Object error,
+  required bool receivedAnyChunk,
+}) {
+  if (receivedAnyChunk) {
+    return false;
+  }
+  if (error is sdk.ApiException) {
+    return error.statusCode == 500 ||
+        error.statusCode == 502 ||
+        error.statusCode == 503 ||
+        error.statusCode == 504;
+  }
+  final text = error.toString().toLowerCase();
+  return text.contains('bad gateway') ||
+      text.contains('service unavailable') ||
+      text.contains('gateway timeout') ||
+      text.contains('provider returned 500') ||
+      text.contains('provider returned 502') ||
+      text.contains('provider returned 503') ||
+      text.contains('provider returned 504');
 }
 
 final class _ResolvedClientConfig {
